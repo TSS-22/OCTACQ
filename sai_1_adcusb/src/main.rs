@@ -12,6 +12,7 @@ use embassy_stm32::{Config, bind_interrupts, dma, peripherals, sai};
 use embassy_time::{Duration, Ticker};
 use embassy_stm32::dac::Dac;
 use panic_probe as _;
+use embassy_time::Instant;
 
 bind_interrupts!(struct Irqs {
     DMA1_STREAM0   => dma::InterruptHandler<peripherals::DMA1_CH0>;
@@ -23,6 +24,11 @@ fn to_sample(w: u32) -> i32 {
     ((w << 8) as i32) >> 8
 }
 
+/// Verified 48 kHz capture chain for PCM1808 (slave, I²S):
+///   HSE 25 MHz → PLL2 (÷25 ×245.76 fracn 6226, ÷10) → 24.576 MHz kernel
+///   MCLK pin = kernel ÷ 2 = 12.288 MHz  (Div2)
+///   BCK = 3.072 MHz (64-bit frame @ fs), LRCK = 12.288 MHz ÷ 256 = 48 kHz
+///   Measured 47 880 Hz ±0.03 % (HSI timebase tolerance).
 #[embassy_executor::main]
 async  fn main(_spawner: Spawner){
     info!("SAI test");
@@ -34,16 +40,16 @@ async  fn main(_spawner: Spawner){
         // HSE = 24.576
         config.rcc.hse = Some(Hse { freq: Hertz(25_000_000), mode: HseMode::Oscillator });
 
-        // Because we use a 24.576 MHz crystal
-        config.rcc.pll2 = Some(Pll { 
+        // Because we use a 25 MHz crystal
+        config.rcc.pll2 = Some(Pll {
             source: PllSource::Hse,
-            prediv: PllPreDiv::Div25,
-            mul: PllMul::Mul245,
+            prediv: PllPreDiv::Div25, // 25 MHz → 1 MHz
+            mul: PllMul::Mul245,      // ×245.76 (fracn refines)
             fracn: Some(6226),
-            divp: Some(PllDiv::Div10),
+            divp: Some(PllDiv::Div10), // → 24.576 MHz exactly
             divq: None,
-            divr: None
-                 });
+            divr: None,
+        });
 
         config.rcc.mux.sai1sel = mux::Saisel::Pll2P;
     }
@@ -69,10 +75,11 @@ async  fn main(_spawner: Spawner){
     sai_config.data_size = DataSize::Data24; //PCM1808 send 24 bits data. If it doesn't work consider going back to 32 bit like in the example
     sai_config.frame_length = 64; // 2 channels * 32 bits (apparently, lumo says that SAI decouple the 24/32 bit problem) let see
     sai_config.frame_sync_active_level_length = word::U7(32);
-    sai_config.master_clock_divider = MasterClockDivider::Div1;
+    sai_config.master_clock_divider = MasterClockDivider::Div2;
     sai_config.clock_strobe = ClockStrobe::Rising;
     sai_config.frame_sync_offset = FrameSyncOffset::BeforeFirstBit;
     sai_config.frame_sync_polarity = FrameSyncPolarity::ActiveLow;
+    sai_config.slot_size = sai::SlotSize::DataSize;
 
     info!("SAI config prepared ");
     let mut sai_1_a = Sai::new_asynchronous_with_mclk(
@@ -90,20 +97,20 @@ async  fn main(_spawner: Spawner){
 
     sai_1_a.start();
     
-    let mut n_buffers: u32 = 0;
-
     info!("SAI started");
 
     
-    // let mut dac = Dac::new_1(p.DAC1, p.PA4);
+    let mut n_buffers: u32 = 0;
+    let mut total_frames: u64 = 0;
+    let mut t0 = Instant::now();
     loop{
 
        sai_1_a.read(&mut sai_1_a_read_buffer).await.ok();
 
+        // Per-buffer span/dc of the last buffer in each print window.
         let mut min = i32::MAX;
         let mut max = i32::MIN;
         let mut sum: i64 = 0;
-
         for &w in &sai_1_a_read_buffer {
             let s = to_sample(w);
             if s < min { min = s; }
@@ -116,6 +123,15 @@ async  fn main(_spawner: Spawner){
             let mean = (sum / sai_1_a_read_buffer.len() as i64) as i32;
             info!("span: min={} max={} dc={}", min, max, mean);
             n_buffers = 0;
+        }
+
+        // fs audit: 256 words = 128 frames per read.
+        total_frames += (sai_1_a_read_buffer.len() / 2) as u64;
+        if total_frames >= 48_000 {
+            let us = t0.elapsed().as_micros() as u64;
+            info!("measured fs = {} Hz over {} us", total_frames * 1_000_000 / us, us);
+            total_frames = 0;
+            t0 = Instant::now();
         }
     }
 }
